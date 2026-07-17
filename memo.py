@@ -6,6 +6,8 @@ import json
 import os
 import sys
 import io
+import ctypes
+from ctypes import wintypes
 import base64
 import uuid
 from datetime import datetime
@@ -388,6 +390,13 @@ def _hex_to_rgb(h):
     return tuple(int(h[i:i+2], 16) for i in (1, 3, 5))
 
 
+def _get_work_area():
+    SPI_GETWORKAREA = 0x0030
+    rect = wintypes.RECT()
+    ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+
 # ---- MemoWindow ----
 class MemoWindow:
     RESIZE_MARGIN = 3
@@ -396,7 +405,6 @@ class MemoWindow:
         self.widget = widget
         self.root = tk.Toplevel()
         self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
         self.root.configure(bg=DIVIDER)
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
@@ -410,6 +418,32 @@ class MemoWindow:
         self._row_widgets = []
         self._resize_dir = None
         self._build()
+        self._ensure_taskbar_icon()
+
+    def _ensure_taskbar_icon(self):
+        """overrideredirect(True) 的窗口 Windows 默认不会放到任务栏、
+        也进不了 Alt+Tab 列表，以前只能靠一直置顶 (-topmost) 来保证
+        还能找得到它，但常驻置顶又会一直挡在别的应用上面。
+        这里直接改 Windows 的扩展窗口样式：把 WS_EX_TOOLWINDOW 换成
+        WS_EX_APPWINDOW，这样即使不置顶也能正常出现在任务栏、能被
+        Alt+Tab 切换到——这跟 overrideredirect 完全是两回事，不会因此
+        把系统自带的边框标题栏带回来。"""
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                hwnd = self.root.winfo_id()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            # 改完扩展样式后任务栏未必马上刷新，隐藏再显示一次强制刷新
+            self.root.withdraw()
+            self.root.after(10, self.root.deiconify)
+        except Exception:
+            pass
 
     def _build(self):
         card = tk.Frame(self.root, bg=BG)
@@ -868,11 +902,6 @@ class MemoWindow:
             pass
 
     def _show_image_popup(self, pil_img):
-        """类似微信 PC 端的看图体验：默认窗口尺寸跟着图片走，右上角多了个最大化
-        按钮，点一下可以展开到几乎全屏，再点一下恢复回原来的窗口尺寸。
-        点图片切换适应窗口/100%原图两级缩放，滚轮缩放，放大后可
-        拖动图片；拖动窗口空白处可以移动整个看图窗口，点一下空白处/
-        右上角关闭按钮/Esc 关闭。"""
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
 
@@ -892,21 +921,20 @@ class MemoWindow:
             return w_, h_
 
         def compute_maxed():
-            # 最大化不是真正占满整个屏幕，四周留一点边距，看起来更精致
-            return int(sw * 0.98), int(sh * 0.95)
+            l, t, w, h = _get_work_area()
+            state["_wa_left"], state["_wa_top"] = l, t
+            return w, h
 
         ww, wh = compute_snug()
         wx, wy = (sw - ww) // 2, (sh - wh) // 2
         snug_geom = (ww, wh, wx, wy)
 
-        # 预览背景用浅灰色，不用黑色也不用纯白——比应用自己的
-        # BG 稍深一点，这样即使图片本身背景是白色也能看出轮廓，
-        # 视觉上比纯黑软和，跟整个 app 的浅色风格也更一致。
         preview_bg = "#E8E8EC"
         text_dim = "#8B8B92"
         text_hover = ACCENT_DARK
 
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.geometry(f"{ww}x{wh}+{wx}+{wy}")
@@ -925,24 +953,17 @@ class MemoWindow:
             "cur_w": ww, "cur_h": wh,
             "maximized": False,
             "snug_geom": snug_geom,
-            # 双击预览时，第二下的抬起/按下可能直接落在新弹出的预览
-            # 窗口上，没有对应的 on_press 先执行过，这里用 .get 加默认
-            # 值免得 KeyError
             "has_press": False,
+            "_anim": None,
+            "_closing": False,
         }
 
         def calc_fit_scale(w_, h_):
-            # 之前用 canvas.winfo_width()/height() 现查实际尺寸，但刚刚
-            # 新建的 Toplevel 还没真正映射出来时，这个查询在 Windows 上
-            # 有时会返回还没完全展开的旧值，导致图片缩放比例算错、
-            # 看起来像“看不到图片”。现在直接用我们自己设置窗口时
-            # 就知道的尺寸数值，不依赖 Tk 的实时查询，没有时序问题。
             avail_w = w_ - pad * 2
             avail_h = h_ - pad * 2 - bottom
             return min(avail_w / pil_img.width, avail_h / pil_img.height, 1.0)
 
         def clamp_offset():
-            # 缩放到接近“适应窗口”时，居中不允许再拖偏
             if state["scale"] <= state["fit_scale"] + 0.001:
                 state["ox"] = 0.0
                 state["oy"] = 0.0
@@ -959,12 +980,70 @@ class MemoWindow:
             cy = (ch - bottom) / 2 + state["oy"]
             canvas.create_image(cx, cy, image=state["tk_img"], anchor="center", tags="img")
 
+        def cancel_anim():
+            if state["_anim"] is not None:
+                win.after_cancel(state["_anim"])
+                state["_anim"] = None
+
+        def animate_to_scale(target):
+            cancel_anim()
+            def step():
+                cur = state["scale"]
+                if abs(cur - target) < 0.0005:
+                    state["scale"] = target
+                    clamp_offset()
+                    render()
+                    return
+                state["scale"] = cur + (target - cur) * 0.18
+                clamp_offset()
+                render()
+                state["_anim"] = win.after(16, step)
+            state["_anim"] = win.after(1, step)
+
+        def zoom_in(step=0):
+            total, fps = 5, 60
+            progress = min(1.0, step / total)
+            eased = 1 - (1 - progress) ** 3
+            s = 0.92 + 0.08 * eased
+            cur_w = int(ww * s)
+            cur_h = int(wh * s)
+            cx = wx + (ww - cur_w) // 2
+            cy = wy + (wh - cur_h) // 2
+            win.geometry(f"{cur_w}x{cur_h}+{cx}+{cy}")
+            state["cur_w"], state["cur_h"] = cur_w, cur_h
+            state["win_x"], state["win_y"] = cx, cy
+            if progress < 1.0:
+                state["_anim"] = win.after(1000 // fps, lambda: zoom_in(step + 1))
+            else:
+                render()
+                state["_anim"] = None
+
+        def close_with_zoom():
+            if state["_closing"]:
+                return
+            state["_closing"] = True
+            cancel_anim()
+            bw, bh = state["cur_w"], state["cur_h"]
+            bx, by = state["win_x"], state["win_y"]
+            def zoom_out(step=0):
+                total, fps = 3, 60
+                progress = min(1.0, step / total)
+                s = 1.0 - 0.08 * progress
+                cur_w = int(bw * s)
+                cur_h = int(bh * s)
+                cx = bx + (bw - cur_w) // 2
+                cy = by + (bh - cur_h) // 2
+                win.geometry(f"{cur_w}x{cur_h}+{cx}+{cy}")
+                if progress < 1.0:
+                    state["_anim"] = win.after(1000 // fps, lambda: zoom_out(step + 1))
+                else:
+                    win.destroy()
+            zoom_out(0)
+
         state["fit_scale"] = calc_fit_scale(ww, wh)
         state["scale"] = state["fit_scale"]
         render()
 
-        # ---- 右上角按钮：最大化/还原 + 关闭，都用 relx 定位，
-        # 这样窗口尺寸变化时位置会自动跟着调，不用手动重新 place
         max_btn = tk.Canvas(win, width=26, height=26, bg=preview_bg,
                              highlightthickness=0, cursor="hand2")
         max_btn.place(relx=1.0, x=-72, y=12)
@@ -975,21 +1054,20 @@ class MemoWindow:
                 max_btn.create_oval(1, 1, 25, 25, fill="#DCDCE2", outline="")
             fg = text_hover if hover else text_dim
             if state["maximized"]:
-                # 还原图标：两个错开的小方框
                 max_btn.create_rectangle(9, 7, 18, 16, outline=fg, width=1.4)
                 max_btn.create_rectangle(7, 10, 16, 19, outline=fg, width=1.4, fill=preview_bg)
             else:
-                # 最大化图标：单个方框
                 max_btn.create_rectangle(7, 7, 19, 19, outline=fg, width=1.4)
 
         draw_max_btn()
 
         def toggle_maximize(event=None):
+            cancel_anim()
             if not state["maximized"]:
                 state["snug_geom"] = (state["cur_w"], state["cur_h"],
                                        state["win_x"], state["win_y"])
                 mw, mh = compute_maxed()
-                mx, my = (sw - mw) // 2, (sh - mh) // 2
+                mx, my = state["_wa_left"], state["_wa_top"]
                 win.geometry(f"{mw}x{mh}+{mx}+{my}")
                 state["cur_w"], state["cur_h"] = mw, mh
                 state["win_x"], state["win_y"] = mx, my
@@ -1014,7 +1092,7 @@ class MemoWindow:
         close_btn = tk.Label(win, text="\u2715", fg=text_dim, bg=preview_bg,
                               font=(FONT, 14), cursor="hand2")
         close_btn.place(relx=1.0, x=-40, y=12)
-        close_btn.bind("<Button-1>", lambda e: win.destroy())
+        close_btn.bind("<Button-1>", lambda e: close_with_zoom())
         close_btn.bind("<Enter>", lambda e: close_btn.config(fg=text_hover))
         close_btn.bind("<Leave>", lambda e: close_btn.config(fg=text_dim))
 
@@ -1027,12 +1105,12 @@ class MemoWindow:
             return bbox and bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
 
         def toggle_zoom():
+            cancel_anim()
             if state["scale"] <= state["fit_scale"] + 0.001:
-                state["scale"] = 1.0 if 1.0 > state["fit_scale"] else state["fit_scale"] * 2.2
+                target = 1.0 if 1.0 > state["fit_scale"] else state["fit_scale"] * 2.2
             else:
-                state["scale"] = state["fit_scale"]
-            clamp_offset()
-            render()
+                target = state["fit_scale"]
+            animate_to_scale(target)
 
         def on_press(event):
             state["has_press"] = True
@@ -1058,7 +1136,6 @@ class MemoWindow:
                     state["oy"] = state["start_offset"][1] + dy
                     render()
             elif not state["maximized"]:
-                # 拖动空白区域：移动整个看图窗口（最大化时不允许拖动）
                 rdx = event.x_root - state["press_root_xy"][0]
                 rdy = event.y_root - state["press_root_xy"][1]
                 state["win_x"] = state["start_win_xy"][0] + rdx
@@ -1076,23 +1153,25 @@ class MemoWindow:
             if state["press_on_img"]:
                 toggle_zoom()
             else:
-                win.destroy()
+                close_with_zoom()
 
         def on_wheel(event):
+            cancel_anim()
             factor = 1.15 if event.delta > 0 else (1 / 1.15)
-            new_scale = state["scale"] * factor
-            new_scale = max(state["fit_scale"] * 0.7, min(new_scale, state["fit_scale"] * 8))
-            state["scale"] = new_scale
-            clamp_offset()
-            render()
+            target = state["scale"] * factor
+            target = max(state["fit_scale"] * 0.7, min(target, state["fit_scale"] * 8))
+            animate_to_scale(target)
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
         canvas.bind("<MouseWheel>", on_wheel)
-        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Escape>", lambda e: close_with_zoom())
         win.grab_set()
         win.focus_force()
+
+        win.deiconify()
+        zoom_in(0)
 
     def _on_paste(self, event=None):
         """拦截 Ctrl+V：如果剪贴板有图片则插入图片，否则正常粘贴文本"""
@@ -1154,9 +1233,14 @@ class MemoWindow:
 
     def show(self):
         self._populate()
+        # 平时不常驻置顶，但打开的瞬间短暂置顶一下，保证能真正跳到
+        # 当前焦点应用前面（光用 lift() 有时押不过别的窗口），
+        # 过一下子就取消，不会一直挡在别的应用上面。
+        self.root.attributes("-topmost", True)
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        self.root.after(200, lambda: self.root.attributes("-topmost", False))
 
     def collapse(self):
         self._save_if_dirty()
