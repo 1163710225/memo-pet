@@ -1,9 +1,13 @@
 import tkinter as tk
 from tkinter import messagebox
-from PIL import Image, ImageDraw, ImageFilter, ImageTk
+import tkinter.font as tkfont
+from PIL import Image, ImageDraw, ImageFilter, ImageTk, ImageGrab
 import json
 import os
 import sys
+import io
+import base64
+import uuid
 from datetime import datetime
 
 # PyInstaller 兼容：打包后 __file__ 指向虚拟路径，数据文件通过 sys._MEIPASS 访问
@@ -473,20 +477,6 @@ class MemoWindow:
         self._list_canvas.bind("<MouseWheel>", self._on_wheel)
         self._list_inner.bind("<MouseWheel>", self._on_wheel)
 
-        sf = tk.Frame(sb, bg=SIDEBAR_BG, height=34)
-        sf.pack(fill="x")
-        sf.pack_propagate(False)
-        tk.Frame(sf, bg=DIVIDER, height=1).pack(fill="x")
-
-        self._del_lbl = tk.Label(sf, text="删除当前便签", bg=SIDEBAR_BG, fg=FAINT,
-                                  font=(FONT, 9), cursor="hand2", anchor="w")
-        self._del_lbl.pack(side="left", padx=16, pady=(6, 0))
-        self._del_lbl.bind("<Button-1>", lambda e: self._delete())
-        self._del_lbl.bind("<Enter>", lambda e: self._del_lbl.config(
-            fg=DANGER if self.current_index is not None else FAINT))
-        self._del_lbl.bind("<Leave>", lambda e: self._del_lbl.config(
-            fg=DANGER if self.current_index is not None else FAINT))
-
         editor_wrap = tk.Frame(body, bg=EDITOR_BG)
         editor_wrap.pack(side="left", fill="both", expand=True)
 
@@ -502,6 +492,8 @@ class MemoWindow:
                               spacing3=4, relief="flat")
         self._text.pack(side="left", fill="both", expand=True, padx=(0, 4))
         self._text.bind("<KeyRelease>", self._on_type)
+        self._text.bind("<Control-v>", self._on_paste)
+        self._text.bind("<Double-Button-1>", self._on_dbl_click)
         self._text.bind("<FocusIn>", lambda e: self._maybe_clear_placeholder())
 
         self._populate()
@@ -604,19 +596,64 @@ class MemoWindow:
 
         for i, n in enumerate(self.notes):
             t = n.get("title", "").strip()
-            c = n.get("content", "").strip()
-            if not t and c:
-                t = c.split("\n")[0][:16]
+            content = n.get("content", "")
+            # 从 segments 或纯文本中提取预览
+            snippet = ""
+            if isinstance(content, list):
+                for seg in content:
+                    if seg[0] == "text":
+                        text_content = seg[1]
+                        if not t:
+                            t = text_content.strip().split("\n")[0][:16]
+                        if not snippet:
+                            lines = text_content.strip().split("\n")
+                            if len(lines) > 1:
+                                for line in lines[1:]:
+                                    if line.strip():
+                                        snippet = line.strip()
+                                        break
+                            elif seg[1] != content[0][1] if len(content) > 1 else True:
+                                pass
+                            else:
+                                for s in content:
+                                    if s[0] == "text" and s[1].strip():
+                                        for line in s[1].strip().split("\n")[1:]:
+                                            if line.strip():
+                                                snippet = line.strip()
+                                                break
+                                        if snippet:
+                                            break
+                    elif seg[0] == "image" and not snippet:
+                        snippet = "[图片]"
+            else:
+                c = str(content)
+                if not t and c:
+                    t = c.split("\n")[0][:16]
+                lines = c.strip().split("\n")
+                for line in lines[1:]:
+                    if line.strip():
+                        snippet = line.strip()
+                        break
             if not t:
                 t = "无标题"
-            snippet_lines = c.split("\n")
-            snippet = ""
-            for line in snippet_lines[1:]:
-                if line.strip():
-                    snippet = line.strip()
-                    break
             row = self._make_row(i, t, snippet)
             self._row_widgets.append(row)
+
+    def _ellipsize(self, text, max_px, bold=False):
+        """按字体实际渲染宽度截断文字，超出 max_px 就用“…”结尾，
+        确保标题 Label 永远不会把右侧的删除按钮挤出可视范围。"""
+        f = tkfont.Font(family=FONT, size=10, weight="bold" if bold else "normal")
+        if f.measure(text) <= max_px:
+            return text
+        ell = "…"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if f.measure(text[:mid] + ell) <= max_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo] + ell) if lo < len(text) else text
 
     def _make_row(self, index, title_text, snippet_text):
         selected = index == self.current_index
@@ -627,12 +664,31 @@ class MemoWindow:
         pad = tk.Frame(row, bg=bg)
         pad.pack(fill="x", padx=10, pady=7)
 
-        t_lbl = tk.Label(pad, text=title_text, bg=bg,
+        # 标题和删除按钮同一行，标题占据剩余宽度，X 贴在右侧，这样
+        # 每一行都能直接点右上角删除，不用先选中再去底部找删除链接
+        header = tk.Frame(pad, bg=bg)
+        header.pack(fill="x")
+
+        # 标题文字过长时要省略号截断，不然 Label 会按完整文字宽度
+        # 请求空间，超出侧边栏实际宽度后右侧的 X 就会被挤出可视范围，
+        # 看起来像是“不见了”。按字体实际像素宽度测量后截断，比按
+        # 字符数盲猜准确，中英文混排时也不会误判。
+        avail_px = SIDEBAR_W - 64  # 几块 padding 加 X 按钮自身宽度的大致留白
+        display_title = self._ellipsize(title_text, avail_px, bold=selected)
+
+        t_lbl = tk.Label(header, text=display_title, bg=bg,
                           fg=(ACCENT_DARK if selected else TEXT),
                           font=(FONT, 10, "bold" if selected else "normal"), anchor="w")
-        t_lbl.pack(fill="x")
+        t_lbl.pack(side="left", fill="x", expand=True)
 
-        widgets = [row, pad, t_lbl]
+        x_btn = tk.Label(header, text="\u2715", bg=bg, fg=FAINT,
+                          font=(FONT, 9), cursor="hand2")
+        x_btn.pack(side="right", padx=(6, 0))
+        x_btn.bind("<Button-1>", lambda e, i=index: self._delete_row(i))
+        x_btn.bind("<Enter>", lambda e: x_btn.config(fg=DANGER))
+        x_btn.bind("<Leave>", lambda e: x_btn.config(fg=FAINT))
+
+        widgets = [row, pad, header, t_lbl]
         if snippet_text:
             s_lbl = tk.Label(pad, text=snippet_text, bg=bg, fg=SUB, font=(FONT, 8), anchor="w")
             s_lbl.pack(fill="x", pady=(2, 0))
@@ -641,9 +697,11 @@ class MemoWindow:
         def on_enter(e):
             if index != self.current_index:
                 for w in widgets: w.config(bg="#F1F1F6")
+                x_btn.config(bg="#F1F1F6")
         def on_leave(e):
             if index != self.current_index:
                 for w in widgets: w.config(bg=SIDEBAR_BG)
+                x_btn.config(bg=SIDEBAR_BG)
         def on_click(e):
             self._select(index)
 
@@ -662,10 +720,40 @@ class MemoWindow:
         self.current_index = i
         n = self.notes[i]
         self._text.delete("1.0", "end")
-        self._text.insert("1.0", n.get("content", ""))
+        # 初始化图片引用
+        self._images = {}
+        self._img_name_map = {}
+        if not hasattr(self, '_tk_images'):
+            self._tk_images = []
+        content = n.get("content", "")
+        # 兼容旧格式（纯文本字符串）
+        if isinstance(content, str):
+            if content:
+                self._text.insert("1.0", content)
+        # 新格式（segments 数组）
+        elif isinstance(content, list):
+            for seg in content:
+                if seg[0] == "text":
+                    self._text.insert("end", seg[1])
+                elif seg[0] == "image":
+                    try:
+                        img_data = base64.b64decode(seg[1])
+                        img = Image.open(io.BytesIO(img_data))
+                        tk_img = ImageTk.PhotoImage(img)
+                        img_id = seg[2] if len(seg) > 2 else str(uuid.uuid4())[:8]
+                        self._images[img_id] = seg[1]
+                        img_tk_name = self._text.image_create("end", image=tk_img)
+                        if not hasattr(self, '_img_name_map'):
+                            self._img_name_map = {}
+                        self._img_name_map[img_tk_name] = img_id
+                        # 保持引用防止被GC
+                        if not hasattr(self, '_tk_images'):
+                            self._tk_images = []
+                        self._tk_images.append(tk_img)
+                    except Exception:
+                        pass
         self._dirty = False
         self._text.focus_set()
-        self._del_lbl.config(fg=DANGER)
         ts = n.get("updated_at", "")
         if ts:
             try:
@@ -678,7 +766,7 @@ class MemoWindow:
     def _add(self):
         self._save()
         n = {"id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
-             "title": "", "content": "",
+             "title": "", "content": [],
              "created_at": datetime.now().isoformat(),
              "updated_at": datetime.now().isoformat()}
         self.notes.insert(0, n)
@@ -686,29 +774,69 @@ class MemoWindow:
         self.current_index = None
         self._text.delete("1.0", "end")
         self._meta_lbl.config(text="")
-        self._del_lbl.config(fg=FAINT)
         self._populate()
         self._select(0)
 
-    def _delete(self):
-        if self.current_index is None:
-            return
-        del self.notes[self.current_index]
+    def _delete_row(self, i):
+        """直接删除第 i 行，不需要先选中。如果删的是当前选中的那条，
+        清空编辑区；如果删的行在当前选中项前面，后面所有行都会整体
+        前移一位，需要同步修正 current_index，不然会选中错行。"""
+        if i == self.current_index:
+            self.current_index = None
+            self._text.delete("1.0", "end")
+            self._meta_lbl.config(text="")
+            self._dirty = False
+        elif self.current_index is not None and i < self.current_index:
+            self.current_index -= 1
+        del self.notes[i]
         self._flush()
-        self.current_index = None
-        self._text.delete("1.0", "end")
-        self._meta_lbl.config(text="")
-        self._dirty = False
-        self._del_lbl.config(fg=FAINT)
         self._populate()
 
     def _save(self):
         if self.current_index is None:
             return
-        c = self._text.get("1.0", "end-1c").rstrip("\n")
-        fl = c.strip().split("\n")[0].strip() if c.strip() else ""
-        self.notes[self.current_index].update(content=c, title=fl,
-                                                updated_at=datetime.now().isoformat())
+        # 构建 segments：遍历 Text 内容，提取文本和图片
+        segments = []
+        text_lines = self._text.get("1.0", "end-1c").split("\n")
+
+        # 简化方案：纯文本 + 图片标记，保存为 segments
+        # 先收集所有文本并标记图片位置
+        full_text = self._text.get("1.0", "end")
+        # 用 dump 获取所有内容（文本 + 图片引用）
+        dumped = self._text.dump("1.0", "end-1c")
+        current_text = []
+        for item in dumped:
+            if item[0] == "text":
+                current_text.append(item[1])
+            elif item[0] == "image":
+                if current_text:
+                    txt = "".join(current_text)
+                    if txt.rstrip("\n"):
+                        segments.append(["text", txt])
+                    current_text = []
+                # item[1] 是 tk 内部自动生成的图片句柄（比如 "image1"），
+                # 不能直接拿它去 self._images 里找——self._images 的 key 是
+                # uuid 而不是这个句柄。两者的对应关系存在 self._img_name_map 里，
+                # 要先翻译成 img_id 再去查 self._images，之前直接用 tk 句柄查
+                # 永远查不到，图片 segment 就会被静默跳过，保存后图片就丢了。
+                tk_name = item[1]
+                img_id = getattr(self, '_img_name_map', {}).get(tk_name)
+                if img_id and img_id in getattr(self, '_images', {}):
+                    segments.append(["image", self._images[img_id], img_id])
+        if current_text:
+            txt = "".join(current_text)
+            if txt.rstrip("\n"):
+                segments.append(["text", txt])
+
+        # 获取标题
+        first_text = ""
+        for seg in segments:
+            if seg[0] == "text":
+                first_text = seg[1].strip().split("\n")[0][:50]
+                break
+        self.notes[self.current_index].update(
+            content=segments, title=first_text,
+            updated_at=datetime.now().isoformat())
         self._dirty = False
         self._flush()
 
@@ -719,6 +847,290 @@ class MemoWindow:
 
     def _maybe_clear_placeholder(self):
         pass
+
+    def _on_dbl_click(self, event):
+        """双击图片放大查看"""
+        try:
+            pos = self._text.index(f"@{event.x},{event.y}")
+            dumped = self._text.dump(f"{pos} linestart", f"{pos} lineend+1c")
+            for item in dumped:
+                if item[0] == "image":
+                    tk_name = item[1]
+                    img_map = getattr(self, '_img_name_map', {})
+                    img_id = img_map.get(tk_name)
+                    if img_id and img_id in getattr(self, '_images', {}):
+                        b64 = self._images[img_id]
+                        img_data = base64.b64decode(b64)
+                        img = Image.open(io.BytesIO(img_data))
+                        self._show_image_popup(img)
+                        return
+        except Exception:
+            pass
+
+    def _show_image_popup(self, pil_img):
+        """类似微信 PC 端的看图体验：默认窗口尺寸跟着图片走，右上角多了个最大化
+        按钮，点一下可以展开到几乎全屏，再点一下恢复回原来的窗口尺寸。
+        点图片切换适应窗口/100%原图两级缩放，滚轮缩放，放大后可
+        拖动图片；拖动窗口空白处可以移动整个看图窗口，点一下空白处/
+        右上角关闭按钮/Esc 关闭。"""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+
+        pad = 24
+        bottom = 30
+
+        def compute_snug():
+            max_w = int(sw * 0.95)
+            max_h = int(sh * 0.92)
+            avail_w = max_w - pad * 2
+            avail_h = max_h - pad * 2 - bottom
+            fs = min(avail_w / pil_img.width, avail_h / pil_img.height, 1.0)
+            dw = max(1, int(pil_img.width * fs))
+            dh = max(1, int(pil_img.height * fs))
+            w_ = max(700, dw + pad * 2)
+            h_ = max(520, dh + pad * 2 + bottom)
+            return w_, h_
+
+        def compute_maxed():
+            # 最大化不是真正占满整个屏幕，四周留一点边距，看起来更精致
+            return int(sw * 0.98), int(sh * 0.95)
+
+        ww, wh = compute_snug()
+        wx, wy = (sw - ww) // 2, (sh - wh) // 2
+        snug_geom = (ww, wh, wx, wy)
+
+        # 预览背景用浅灰色，不用黑色也不用纯白——比应用自己的
+        # BG 稍深一点，这样即使图片本身背景是白色也能看出轮廓，
+        # 视觉上比纯黑软和，跟整个 app 的浅色风格也更一致。
+        preview_bg = "#E8E8EC"
+        text_dim = "#8B8B92"
+        text_hover = ACCENT_DARK
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry(f"{ww}x{wh}+{wx}+{wy}")
+        win.configure(bg=preview_bg)
+
+        canvas = tk.Canvas(win, bg=preview_bg, highlightthickness=0, cursor="hand2")
+        canvas.pack(fill="both", expand=True)
+
+        state = {
+            "scale": 1.0,
+            "fit_scale": 1.0,
+            "ox": 0.0, "oy": 0.0,
+            "tk_img": None,
+            "dragging": False,
+            "win_x": wx, "win_y": wy,
+            "cur_w": ww, "cur_h": wh,
+            "maximized": False,
+            "snug_geom": snug_geom,
+            # 双击预览时，第二下的抬起/按下可能直接落在新弹出的预览
+            # 窗口上，没有对应的 on_press 先执行过，这里用 .get 加默认
+            # 值免得 KeyError
+            "has_press": False,
+        }
+
+        def calc_fit_scale(w_, h_):
+            # 之前用 canvas.winfo_width()/height() 现查实际尺寸，但刚刚
+            # 新建的 Toplevel 还没真正映射出来时，这个查询在 Windows 上
+            # 有时会返回还没完全展开的旧值，导致图片缩放比例算错、
+            # 看起来像“看不到图片”。现在直接用我们自己设置窗口时
+            # 就知道的尺寸数值，不依赖 Tk 的实时查询，没有时序问题。
+            avail_w = w_ - pad * 2
+            avail_h = h_ - pad * 2 - bottom
+            return min(avail_w / pil_img.width, avail_h / pil_img.height, 1.0)
+
+        def clamp_offset():
+            # 缩放到接近“适应窗口”时，居中不允许再拖偏
+            if state["scale"] <= state["fit_scale"] + 0.001:
+                state["ox"] = 0.0
+                state["oy"] = 0.0
+
+        def render():
+            cw, ch = state["cur_w"], state["cur_h"]
+            s = state["scale"]
+            nw = max(1, int(pil_img.width * s))
+            nh = max(1, int(pil_img.height * s))
+            resized = pil_img.resize((nw, nh), Image.LANCZOS)
+            state["tk_img"] = ImageTk.PhotoImage(resized)
+            canvas.delete("img")
+            cx = cw / 2 + state["ox"]
+            cy = (ch - bottom) / 2 + state["oy"]
+            canvas.create_image(cx, cy, image=state["tk_img"], anchor="center", tags="img")
+
+        state["fit_scale"] = calc_fit_scale(ww, wh)
+        state["scale"] = state["fit_scale"]
+        render()
+
+        # ---- 右上角按钮：最大化/还原 + 关闭，都用 relx 定位，
+        # 这样窗口尺寸变化时位置会自动跟着调，不用手动重新 place
+        max_btn = tk.Canvas(win, width=26, height=26, bg=preview_bg,
+                             highlightthickness=0, cursor="hand2")
+        max_btn.place(relx=1.0, x=-72, y=12)
+
+        def draw_max_btn(hover=False):
+            max_btn.delete("all")
+            if hover:
+                max_btn.create_oval(1, 1, 25, 25, fill="#DCDCE2", outline="")
+            fg = text_hover if hover else text_dim
+            if state["maximized"]:
+                # 还原图标：两个错开的小方框
+                max_btn.create_rectangle(9, 7, 18, 16, outline=fg, width=1.4)
+                max_btn.create_rectangle(7, 10, 16, 19, outline=fg, width=1.4, fill=preview_bg)
+            else:
+                # 最大化图标：单个方框
+                max_btn.create_rectangle(7, 7, 19, 19, outline=fg, width=1.4)
+
+        draw_max_btn()
+
+        def toggle_maximize(event=None):
+            if not state["maximized"]:
+                state["snug_geom"] = (state["cur_w"], state["cur_h"],
+                                       state["win_x"], state["win_y"])
+                mw, mh = compute_maxed()
+                mx, my = (sw - mw) // 2, (sh - mh) // 2
+                win.geometry(f"{mw}x{mh}+{mx}+{my}")
+                state["cur_w"], state["cur_h"] = mw, mh
+                state["win_x"], state["win_y"] = mx, my
+                state["maximized"] = True
+            else:
+                w_, h_, x_, y_ = state["snug_geom"]
+                win.geometry(f"{w_}x{h_}+{x_}+{y_}")
+                state["cur_w"], state["cur_h"] = w_, h_
+                state["win_x"], state["win_y"] = x_, y_
+                state["maximized"] = False
+            state["ox"] = 0.0
+            state["oy"] = 0.0
+            state["fit_scale"] = calc_fit_scale(state["cur_w"], state["cur_h"])
+            state["scale"] = state["fit_scale"]
+            draw_max_btn()
+            render()
+
+        max_btn.bind("<Button-1>", toggle_maximize)
+        max_btn.bind("<Enter>", lambda e: draw_max_btn(True))
+        max_btn.bind("<Leave>", lambda e: draw_max_btn(False))
+
+        close_btn = tk.Label(win, text="\u2715", fg=text_dim, bg=preview_bg,
+                              font=(FONT, 14), cursor="hand2")
+        close_btn.place(relx=1.0, x=-40, y=12)
+        close_btn.bind("<Button-1>", lambda e: win.destroy())
+        close_btn.bind("<Enter>", lambda e: close_btn.config(fg=text_hover))
+        close_btn.bind("<Leave>", lambda e: close_btn.config(fg=text_dim))
+
+        hint = tk.Label(win, text="点击图片可放大 / 缩小 \u00b7 滚轮缩放 \u00b7 拖动空白移动窗口 \u00b7 Esc 关闭",
+                        fg=text_dim, bg=preview_bg, font=(FONT, 9))
+        hint.place(relx=0.5, rely=1.0, y=-20, anchor="center")
+
+        def on_image(x, y):
+            bbox = canvas.bbox("img")
+            return bbox and bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
+
+        def toggle_zoom():
+            if state["scale"] <= state["fit_scale"] + 0.001:
+                state["scale"] = 1.0 if 1.0 > state["fit_scale"] else state["fit_scale"] * 2.2
+            else:
+                state["scale"] = state["fit_scale"]
+            clamp_offset()
+            render()
+
+        def on_press(event):
+            state["has_press"] = True
+            state["press_xy"] = (event.x, event.y)
+            state["press_root_xy"] = (event.x_root, event.y_root)
+            state["press_on_img"] = on_image(event.x, event.y)
+            state["start_offset"] = (state["ox"], state["oy"])
+            state["start_win_xy"] = (state["win_x"], state["win_y"])
+            state["dragging"] = False
+
+        def on_drag(event):
+            if not state["has_press"]:
+                return
+            dx = event.x - state["press_xy"][0]
+            dy = event.y - state["press_xy"][1]
+            if abs(dx) > 4 or abs(dy) > 4:
+                state["dragging"] = True
+            if not state["dragging"]:
+                return
+            if state["press_on_img"]:
+                if state["scale"] > state["fit_scale"] + 0.001:
+                    state["ox"] = state["start_offset"][0] + dx
+                    state["oy"] = state["start_offset"][1] + dy
+                    render()
+            elif not state["maximized"]:
+                # 拖动空白区域：移动整个看图窗口（最大化时不允许拖动）
+                rdx = event.x_root - state["press_root_xy"][0]
+                rdy = event.y_root - state["press_root_xy"][1]
+                state["win_x"] = state["start_win_xy"][0] + rdx
+                state["win_y"] = state["start_win_xy"][1] + rdy
+                win.geometry(f"+{state['win_x']}+{state['win_y']}")
+
+        def on_release(event):
+            if not state["has_press"]:
+                return
+            was_drag = state["dragging"]
+            state["dragging"] = False
+            state["has_press"] = False
+            if was_drag:
+                return
+            if state["press_on_img"]:
+                toggle_zoom()
+            else:
+                win.destroy()
+
+        def on_wheel(event):
+            factor = 1.15 if event.delta > 0 else (1 / 1.15)
+            new_scale = state["scale"] * factor
+            new_scale = max(state["fit_scale"] * 0.7, min(new_scale, state["fit_scale"] * 8))
+            state["scale"] = new_scale
+            clamp_offset()
+            render()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        canvas.bind("<MouseWheel>", on_wheel)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.grab_set()
+        win.focus_force()
+
+    def _on_paste(self, event=None):
+        """拦截 Ctrl+V：如果剪贴板有图片则插入图片，否则正常粘贴文本"""
+        try:
+            img = ImageGrab.grabclipboard()
+            if img is not None:
+                # 限制最大宽度
+                if img.width > 400:
+                    ratio = 400 / img.width
+                    img = img.resize((400, int(img.height * ratio)), Image.LANCZOS)
+                # 转 base64
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                img_id = str(uuid.uuid4())[:8]
+                if not hasattr(self, '_images'):
+                    self._images = {}
+                self._images[img_id] = b64
+                # 显示
+                tk_img = ImageTk.PhotoImage(img)
+                img_tk_name = self._text.image_create(tk.INSERT, image=tk_img)
+                self._text.insert(tk.INSERT, "\n")
+                # 映射 tk 内部名称到 UUID
+                if not hasattr(self, '_img_name_map'):
+                    self._img_name_map = {}
+                self._img_name_map[img_tk_name] = img_id
+                # 保持引用
+                if not hasattr(self, '_tk_images'):
+                    self._tk_images = []
+                self._tk_images.append(tk_img)
+                self._dirty = True
+                if self._tid:
+                    self.root.after_cancel(self._tid)
+                self._tid = self.root.after(1200, self._auto_save)
+                return "break"
+        except Exception:
+            pass
+        # 没有图片，正常文本粘贴（不做任何处理，让默认行为执行）
 
     def _on_type(self, event=None):
         self._dirty = True
